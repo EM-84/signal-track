@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SIGNAL.TRACK</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#030712;color:#e5e7eb;font-family:Georgia,serif;min-height:100vh}
+input,textarea,select,button{font-family:inherit}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#0a0f1a}
+::-webkit-scrollbar-thumb{background:#1f2937;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://shcuqjfiqpsxpvjhyqhh.supabase.co";
+const SUPABASE_KEY = "sb_publishable_TS9jbzf5FvuGlxju8g8Dow_ExoMEjJr";
+const getAVKey = () => localStorage.getItem("av_api_key") || "";
+
+// ── Supabase ──────────────────────────────────────────────────────────────────
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+async function dbLoadEntries() {
+  const { data, error } = await sb.from("entries").select("*").order("date", { ascending: false });
+  if (error) throw error;
+  return (data || []).map(r => ({
+    id: r.id, source: r.source, date: r.date,
+    markets: r.markets || [], text: r.text_preview || "", addedAt: r.added_at
+  }));
+}
+async function dbSaveEntry(entry) {
+  const { error } = await sb.from("entries").upsert({
+    id: entry.id, source: entry.source, date: entry.date,
+    markets: entry.markets, text_preview: entry.text?.slice(0,300) || "", added_at: entry.addedAt
+  });
+  if (error) throw error;
+}
+async function dbDeleteEntry(id) {
+  await sb.from("entries").delete().eq("id", id);
+}
+async function dbLoadWeeklyData() {
+  const { data } = await sb.from("weekly_data").select("*");
+  const out = {};
+  (data || []).forEach(r => { out[r.market] = { weeks: r.weeks || [], source: r.source }; });
+  return out;
+}
+async function dbSaveWeeklyData(market, weeks) {
+  await sb.from("weekly_data").upsert({ market, weeks, source: "alphavantage", fetched_at: Date.now() });
+}
+
+// ── Alpha Vantage price fetch ─────────────────────────────────────────────────
+function toAVSymbol(ticker) {
+  if (!ticker) return { symbol: null, type: "stock" };
+  const t = ticker.trim().toUpperCase().replace(".US","").replace("=X","").replace("=F","").replace("^","");
+  const fxPairs = ["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","EURGBP","USDCAD","USDCNH"];
+  if (fxPairs.includes(t)) return { symbol: t, type: "fx" };
+  if (t==="GC"||t==="XAUUSD"||t==="GOLD") return { symbol:"GLD", type:"stock" };
+  if (t==="CL"||t==="OIL"||t==="USO") return { symbol:"USO", type:"stock" };
+  if (t==="SI"||t==="XAGUSD") return { symbol:"SLV", type:"stock" };
+  if (t==="SPX"||t==="GSPC"||t==="SPY") return { symbol:"SPY", type:"stock" };
+  if (t==="NDQ"||t==="IXIC"||t==="QQQ") return { symbol:"QQQ", type:"stock" };
+  if (t==="DJI"||t==="DIA") return { symbol:"DIA", type:"stock" };
+  if (t==="FTX"||t==="FTSE") return { symbol:"ISF.L", type:"stock" };
+  return { symbol: t.replace(/[^A-Z0-9.]/g,""), type:"stock" };
+}
+
+async function fetchPrices(ticker, fromDate) {
+  const avKey = getAVKey();
+  if (!avKey) return { weeks:[], error:"No Alpha Vantage key — add it in ⚙ Settings" };
+  const { symbol, type } = toAVSymbol(ticker);
+  if (!symbol) return { weeks:[], error:"No ticker" };
+  try {
+    const url = type === "fx"
+      ? `https://www.alphavantage.co/query?function=FX_WEEKLY&from_symbol=${symbol.slice(0,3)}&to_symbol=${symbol.slice(3,6)}&apikey=${avKey}`
+      : `https://www.alphavantage.co/query?function=TIME_SERIES_WEEKLY&symbol=${symbol}&apikey=${avKey}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json["Note"] || json["Information"]) return { weeks:[], error:"Rate limit — wait a minute and retry (25 fetches/day free)" };
+    const seriesKey = type==="fx" ? "Time Series FX (Weekly)" : "Weekly Time Series";
+    const series = json[seriesKey];
+    if (!series) return { weeks:[], error:`No data returned for "${symbol}"` };
+    const rows = Object.entries(series)
+      .filter(([d]) => d >= fromDate)
+      .sort(([a],[b]) => a.localeCompare(b))
+      .map(([date, v]) => ({ date, close: parseFloat(v["4. close"] || v["4a. close"] || 0) }))
+      .filter(r => r.close > 0);
+    if (!rows.length) return { weeks:[], error:"No data in date range" };
+    const weeks = rows.map((r,i) => ({
+      week: r.date, close: parseFloat(r.close.toFixed(2)),
+      pct: i===0 ? null : parseFloat(((r.close-rows[i-1].close)/rows[i-1].close*100).toFixed(2))
+    }));
+    return { weeks, error:null };
+  } catch(e) { return { weeks:[], error:e.message }; }
+}
+
+// ── Rating ────────────────────────────────────────────────────────────────────
+const MAGNITUDE=2.0, NOISE=1.0, MIN_CORRECT=3, ALERT_DAYS=14;
+const TODAY = new Date().toISOString().slice(0,10);
+
+function rateCall(sentiment, weeks) {
+  if (!weeks || weeks.length < 4) return "pending";
+  const cum = weeks.slice(0,4).reduce((s,w) => s+(w.pct??0), 0);
+  const up = cum > 0, abs = Math.abs(cum);
+  if (sentiment==="neutral") return abs < MAGNITUDE ? "correct" : "weak";
+  if ((sentiment==="positive"&&up)||(sentiment==="negative"&&!up)) return abs>=MAGNITUDE?"correct":"weak";
+  return abs>=NOISE?"wrong":"weak";
+}
+function weeksFrom(all, fromDate) {
+  const i = all.findIndex(w => w.week >= fromDate);
+  return i===-1 ? [] : all.slice(i);
+}
+function buildPairs(entries, weeklyData) {
+  const map = {};
+  entries.forEach(e => {
+    e.markets.forEach(m => {
+      const key = `${m.market}|||${e.source}`;
+      if (!map[key]) map[key] = { market:m.market, source:e.source, ticker:m.ticker||null, calls:[] };
+      if (m.ticker && !map[key].ticker) map[key].ticker = m.ticker;
+      map[key].calls.push({ date:e.date, sentiment:m.sentiment, quote:m.quote||"" });
+    });
+  });
+  return Object.values(map).map(p => {
+    p.calls.sort((a,b) => a.date.localeCompare(b.date));
+    const aw = weeklyData?.[p.market]?.weeks || [];
+    p.calls = p.calls.map(c => ({ ...c, rating:rateCall(c.sentiment, weeksFrom(aw, c.date)) }));
+    const rated = p.calls.filter(c => c.rating!=="pending");
+    p.correctCount = p.calls.filter(c=>c.rating==="correct").length;
+    p.weakCount    = p.calls.filter(c=>c.rating==="weak").length;
+    p.wrongCount   = p.calls.filter(c=>c.rating==="wrong").length;
+    p.ratedCount   = rated.length; p.totalCount = p.calls.length;
+    p.accuracy = rated.length ? Math.round(((p.correctCount+p.weakCount*0.5)/rated.length)*100) : null;
+    p.isTrusted = p.correctCount >= MIN_CORRECT;
+    p.lastMention = p.calls[p.calls.length-1].date;
+    p.lastSentiment = p.calls[p.calls.length-1].sentiment;
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-ALERT_DAYS);
+    p.recentCall = p.calls.find(c => c.date >= cutoff.toISOString().slice(0,10)) || null;
+    return p;
+  });
+}
+
+// ── Colours ───────────────────────────────────────────────────────────────────
+const SENT = {
+  positive:{color:"#22c55e",bg:"#052e16",icon:"▲",label:"Positive"},
+  negative:{color:"#ef4444",bg:"#1c0202",icon:"▼",label:"Negative"},
+  neutral: {color:"#6b7280",bg:"#111827",icon:"●",label:"Neutral"}
+};
+const RATE = {
+  correct:{color:"#22c55e",bg:"#052e16",label:"✓ Correct"},
+  weak:   {color:"#f59e0b",bg:"#1c1002",label:"◑ Weak"},
+  wrong:  {color:"#ef4444",bg:"#1c0202",label:"✗ Wrong"},
+  pending:{color:"#4b5563",bg:"#111827",label:"⏳ Pending"}
+};
+const aC = a => a===null?"#4b5563":a>=70?"#22c55e":a>=45?"#f59e0b":"#ef4444";
+const ago = d => {
+  const days = Math.round((new Date(TODAY)-new Date(d))/86400000);
+  if(days===0)return"today"; if(days<7)return`${days}d ago`;
+  if(days<30)return`${Math.round(days/7)}w ago`; return`${Math.round(days/30)}mo ago`;
+};
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const g = {
+  root:{fontFamily:"Georgia,serif",background:"#030712",minHeight:"100vh",color:"#e5e7eb"},
+  header:{borderBottom:"1px solid #111827",padding:"14px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10},
+  logo:{fontFamily:"monospace",fontSize:16,fontWeight:700,color:"#f9fafb"},
+  acc:{color:"#f59e0b"},tag:{color:"#374151",fontSize:10,fontFamily:"monospace",marginTop:2},
+  sr:{display:"flex",gap:18},
+  nav:{display:"flex",borderBottom:"1px solid #111827",paddingLeft:18,flexWrap:"wrap"},
+  tab:{background:"none",border:"none",borderBottom:"2px solid transparent",color:"#6b7280",cursor:"pointer",fontFamily:"monospace",fontSize:12,padding:"10px 13px"},
+  tabOn:{color:"#f59e0b",borderBottomColor:"#f59e0b"},
+  main:{maxWidth:860,margin:"0 auto",padding:"22px 18px"},
+  h2:{fontSize:18,fontWeight:400,color:"#f9fafb",marginBottom:5,marginTop:0},
+  desc:{color:"#6b7280",fontSize:13,marginBottom:18,lineHeight:1.6},
+  sub:{fontFamily:"monospace",fontSize:10,textTransform:"uppercase",letterSpacing:1.5,color:"#4b5563",marginBottom:8,marginTop:16},
+  field:{marginBottom:11},
+  lbl:{display:"block",color:"#6b7280",fontSize:10,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1,marginBottom:4},
+  inp:{width:"100%",background:"#0a0f1a",border:"1px solid #1f2937",borderRadius:6,color:"#e5e7eb",fontFamily:"Georgia,serif",fontSize:13,padding:"8px 10px",outline:"none",boxSizing:"border-box"},
+  sel:{background:"#0a0f1a",border:"1px solid #1f2937",borderRadius:6,color:"#e5e7eb",fontFamily:"monospace",fontSize:12,padding:"6px 8px",outline:"none"},
+  btn:{border:"none",borderRadius:6,cursor:"pointer",fontFamily:"monospace",fontSize:12,padding:"8px 14px"},
+  btnP:{background:"#f59e0b",color:"#030712",fontWeight:700},
+  btnS:{background:"#1f2937",color:"#9ca3af"},
+  btnSm:{background:"#111827",color:"#6b7280",border:"1px solid #1f2937",borderRadius:4,cursor:"pointer",fontFamily:"monospace",fontSize:11,padding:"4px 9px"},
+  err:{background:"#1c0202",border:"1px solid #ef444455",borderRadius:6,color:"#ef4444",fontSize:12,padding:"8px 11px",marginBottom:10},
+  ok:{background:"#052e16",border:"1px solid #22c55e33",borderRadius:6,color:"#22c55e",fontSize:12,padding:"8px 11px",marginBottom:10},
+  info:{background:"#0a1020",border:"1px solid #1f3a60",borderRadius:6,color:"#6b9ed4",fontSize:12,padding:"8px 11px",marginBottom:10,lineHeight:1.6},
+  card:{background:"#0a0f1a",border:"1px solid #1a2030",borderRadius:8,padding:"13px 15px",marginBottom:10},
+  chip:{background:"#111827",color:"#6b7280",fontSize:10,padding:"2px 6px",borderRadius:4,fontFamily:"monospace"},
+  badge:{fontSize:10,fontFamily:"monospace",padding:"2px 7px",borderRadius:4,fontWeight:600},
+  empty:{color:"#374151",fontFamily:"monospace",fontSize:12,padding:"36px 0",textAlign:"center"},
+  footer:{borderTop:"1px solid #0d1117",color:"#1f2937",fontFamily:"monospace",fontSize:10,padding:"12px 20px",textAlign:"center"},
+  th:{color:"#4b5563",fontFamily:"monospace",fontSize:10,textTransform:"uppercase",letterSpacing:1,padding:"5px 9px",textAlign:"right",borderBottom:"1px solid #111827"},
+  td:{fontFamily:"monospace",fontSize:11,padding:"4px 9px",textAlign:"right",borderBottom:"1px solid #0d1117"},
+  overlay:{position:"fixed",inset:0,background:"#000000dd",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100},
+  modal:{background:"#0a0f1a",border:"1px solid #1f2937",borderRadius:10,padding:22,width:560,maxHeight:"85vh",overflowY:"auto"},
+};
+
+// ── Small components ──────────────────────────────────────────────────────────
+const Stat = ({label,value,color}) => (
+  <div style={{textAlign:"right"}}>
+    <div style={{color:color||"#e5e7eb",fontFamily:"monospace",fontSize:14,fontWeight:700}}>{value}</div>
+    <div style={{color:"#374151",fontSize:9,textTransform:"uppercase",letterSpacing:1}}>{label}</div>
+  </div>
+);
+const AccBar = ({correct,weak,wrong,total}) => !total?null:(
+  <div style={{display:"flex",height:5,borderRadius:3,overflow:"hidden",width:"100%",gap:1}}>
+    <div style={{width:`${(correct/total)*100}%`,background:"#22c55e"}}/>
+    <div style={{width:`${(weak/total)*100}%`,background:"#f59e0b"}}/>
+    <div style={{width:`${(wrong/total)*100}%`,background:"#ef4444"}}/>
+    <div style={{flex:1,background:"#1f2937"}}/>
+  </div>
+);
+
+function Sparkline({weeks,sentiment}) {
+  if(!weeks||weeks.length<2) return null;
+  let cum=0;
+  const cv=weeks.map(w=>{cum+=(w.pct??0);return cum;});
+  const mn=Math.min(...cv,0),mx=Math.max(...cv,0),rng=mx-mn||1;
+  const W=460,H=80,PL=34,PR=14,PT=8,PB=8,cw=W-PL-PR,ch=H-PT-PB;
+  const toY=v=>PT+((mx-v)/rng)*ch, toX=i=>PL+i*(cw/Math.max(cv.length-1,1));
+  const z=toY(0),lc=cv[cv.length-1]>=0?"#22c55e":"#ef4444";
+  const pts=cv.map((v,i)=>`${toX(i)},${toY(v)}`).join(" ");
+  const area=`M${toX(0)},${z} ${cv.map((v,i)=>`L${toX(i)},${toY(v)}`).join(" ")} L${toX(cv.length-1)},${z}Z`;
+  const m4x=toX(Math.min(3,cv.length-1));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H,display:"block"}}>
+      {[mx,0,mn].filter((v,i,a)=>a.indexOf(v)===i).map(v=>(
+        <text key={v} x={PL-3} y={toY(v)+3} fill="#374151" fontSize="9" fontFamily="monospace" textAnchor="end">{v>=0?"+":""}{v.toFixed(1)}%</text>
+      ))}
+      <line x1={PL} y1={z} x2={W-PR} y2={z} stroke="#1f2937" strokeWidth="1"/>
+      <rect x={PL} y={sentiment==="positive"?PT:z} width={cw} height={sentiment==="positive"?z-PT:H-PB-z} fill={SENT[sentiment]?.color||"#6b7280"} opacity="0.07"/>
+      {cv.length>=4&&<line x1={m4x} y1={PT} x2={m4x} y2={H-PB} stroke="#f59e0b" strokeWidth="1" strokeDasharray="3,3" opacity="0.6"/>}
+      <path d={area} fill={lc} opacity="0.1"/>
+      <polyline points={pts} fill="none" stroke={lc} strokeWidth="1.5" strokeLinejoin="round"/>
+      {cv.map((v,i)=>(
+        <circle key={i} cx={toX(i)} cy={toY(v)} r="2.5" fill={lc} opacity="0.8">
+          <title>{weeks[i].week}: wk {(weeks[i].pct??0)>=0?"+":""}{(weeks[i].pct??0).toFixed(2)}% / cum {v>=0?"+":""}{v.toFixed(2)}%</title>
+        </circle>
+      ))}
+      <text x={toX(cv.length-1)+4} y={toY(cv[cv.length-1])+4} fill={lc} fontSize="10" fontFamily="monospace">
+        {cv[cv.length-1]>=0?"+":""}{cv[cv.length-1].toFixed(1)}%
+      </text>
+    </svg>
+  );
+}
+
+function WeeklyTable({weeks}) {
+  if(!weeks?.length) return null;
+  let cum=0;
+  return (
+    <div style={{overflowX:"auto",marginTop:6}}>
+      <table style={{width:"100%",borderCollapse:"collapse"}}>
+        <thead><tr>{["#","Week","Close","Week %","Cumulative","4w"].map(h=>(
+          <th key={h} style={{...g.th,textAlign:h==="#"||h==="Week"||h==="4w"?"left":"right"}}>{h}</th>
+        ))}</tr></thead>
+        <tbody>{weeks.map((w,i)=>{cum+=(w.pct??0);const p=w.pct??0;const in4=i<4;return(
+          <tr key={w.week} style={{background:in4?"#0d1420":"transparent"}}>
+            <td style={{...g.td,textAlign:"left",color:"#374151"}}>{i+1}</td>
+            <td style={{...g.td,textAlign:"left",color:"#9ca3af"}}>{w.week}</td>
+            <td style={g.td}>{w.close!=null?w.close.toLocaleString():"—"}</td>
+            <td style={{...g.td,color:p>0?"#22c55e":p<0?"#ef4444":"#6b7280",fontWeight:600}}>{p>=0?"+":""}{p.toFixed(2)}%</td>
+            <td style={{...g.td,color:cum>0?"#22c55e":cum<0?"#ef4444":"#6b7280"}}>{cum>=0?"+":""}{cum.toFixed(2)}%</td>
+            <td style={{...g.td,textAlign:"left",color:in4?"#f59e0b":"#1f2937"}}>{in4?"●":""}</td>
+          </tr>
+        );})}</tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Price Modal ───────────────────────────────────────────────────────────────
+function PriceModal({market,ticker,fromDate,existingWeeks,onSave,onClose}) {
+  const [mode,setMode]=useState("auto");
+  const [customTicker,setCustomTicker]=useState(ticker||"");
+  const [fetching,setFetching]=useState(false);
+  const [fetched,setFetched]=useState(null);
+  const [msg,setMsg]=useState(null);
+  const [rows,setRows]=useState(()=>existingWeeks?.length?existingWeeks.map(w=>({week:w.week,close:String(w.close||"")})):[{week:"",close:""}]);
+  const upd=(i,k,v)=>setRows(r=>r.map((row,ri)=>ri===i?{...row,[k]:v}:row));
+  const withPct=rows.map((r,i)=>{
+    const c=parseFloat(r.close),p=i>0?parseFloat(rows[i-1].close):null;
+    return{week:r.week,close:isNaN(c)?null:parseFloat(c.toFixed(2)),pct:(!isNaN(c)&&p&&!isNaN(p))?parseFloat(((c-p)/p*100).toFixed(2)):null};
+  });
+  const doFetch=async()=>{
+    const t=customTicker.trim();
+    if(!t){setMsg({err:"Please enter a ticker."});return;}
+    setFetching(true);setMsg(null);setFetched(null);
+    const{weeks,error}=await fetchPrices(t,fromDate);
+    if(!weeks.length) setMsg({err:error||`No data for "${t}".`});
+    else{setFetched(weeks);setMsg({ok:`✓ ${weeks.length} weeks (${weeks[0].week} → ${weeks[weeks.length-1].week})`});}
+    setFetching(false);
+  };
+  return(
+    <div style={g.overlay}>
+      <div style={g.modal}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:14}}>
+          <span style={{color:"#f9fafb",fontWeight:700,fontSize:14}}>Price data — {market}</span>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#6b7280",cursor:"pointer",fontSize:16}}>✕</button>
+        </div>
+        <div style={{display:"flex",gap:6,marginBottom:14}}>
+          <button style={{...g.btn,...(mode==="auto"?g.btnP:g.btnS),padding:"5px 12px"}} onClick={()=>setMode("auto")}>Auto-fetch</button>
+          <button style={{...g.btn,...(mode==="manual"?g.btnP:g.btnS),padding:"5px 12px"}} onClick={()=>setMode("manual")}>Manual</button>
+        </div>
+        {mode==="auto"&&(
+          <div>
+            <div style={g.info}>
+              Fetches from <strong>Alpha Vantage</strong> (free, 25/day). Add your key in ⚙ Settings.<br/>
+              US stocks: <strong>NFLX</strong>, <strong>AAPL</strong>, <strong>TSLA</strong> · Indices: <strong>SPY</strong> (S&amp;P500), <strong>QQQ</strong> (Nasdaq)<br/>
+              Commodities: <strong>GLD</strong> (Gold), <strong>USO</strong> (Oil) · FX: <strong>EURUSD</strong>, <strong>GBPUSD</strong>
+            </div>
+            <div style={{display:"flex",gap:8,marginBottom:10}}>
+              <input style={{...g.inp,flex:1}} value={customTicker} onChange={e=>{setCustomTicker(e.target.value);setFetched(null);setMsg(null);}} placeholder="e.g. NFLX or EURUSD" onKeyDown={e=>e.key==="Enter"&&doFetch()}/>
+              <button style={{...g.btn,...g.btnP,opacity:fetching?0.6:1,flexShrink:0}} onClick={doFetch} disabled={fetching}>{fetching?"Fetching…":"⬇ Fetch"}</button>
+            </div>
+            {msg?.err&&<div style={g.err}>{msg.err}</div>}
+            {msg?.ok&&<div style={g.ok}>{msg.ok}</div>}
+            {fetched&&(
+              <>
+                <div style={{maxHeight:200,overflowY:"auto",marginBottom:10}}><WeeklyTable weeks={fetched}/></div>
+                <div style={{display:"flex",gap:8}}>
+                  <button style={{...g.btn,...g.btnP}} onClick={()=>onSave(fetched)}>Save {fetched.length} weeks</button>
+                  <button style={{...g.btn,...g.btnS}} onClick={()=>{setFetched(null);setMsg(null);}}>Retry</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {mode==="manual"&&(
+          <div>
+            <p style={{color:"#6b7280",fontSize:12,marginBottom:10}}>Enter weekly closing prices from {fromDate}.</p>
+            <div style={{display:"grid",gridTemplateColumns:"125px 1fr 65px 20px",gap:5,marginBottom:5}}>
+              {["Week (Mon)","Close","Wk %",""].map(h=><span key={h} style={{color:"#4b5563",fontSize:10,fontFamily:"monospace"}}>{h}</span>)}
+            </div>
+            <div style={{maxHeight:240,overflowY:"auto"}}>
+              {rows.map((r,i)=>(
+                <div key={i} style={{display:"grid",gridTemplateColumns:"125px 1fr 65px 20px",gap:5,marginBottom:4}}>
+                  <input style={{...g.inp,padding:"5px 7px",fontSize:12}} type="date" value={r.week} onChange={e=>upd(i,"week",e.target.value)}/>
+                  <input style={{...g.inp,padding:"5px 7px",fontSize:12}} type="number" placeholder="e.g. 479.98" value={r.close} onChange={e=>upd(i,"close",e.target.value)}/>
+                  <span style={{fontFamily:"monospace",fontSize:11,alignSelf:"center",color:withPct[i]?.pct>0?"#22c55e":withPct[i]?.pct<0?"#ef4444":"#6b7280"}}>
+                    {withPct[i]?.pct!=null?(withPct[i].pct>=0?"+":"")+withPct[i].pct.toFixed(1)+"%":"—"}
+                  </span>
+                  <button onClick={()=>setRows(r=>r.filter((_,ri)=>ri!==i))} style={{background:"none",border:"none",color:"#374151",cursor:"pointer",fontSize:13}}>✕</button>
+                </div>
+              ))}
+            </div>
+            <button onClick={()=>setRows(r=>[...r,{week:"",close:""}])} style={{...g.btnSm,marginTop:8,marginBottom:14}}>+ Add week</button>
+            <div style={{display:"flex",gap:8}}>
+              <button style={{...g.btn,...g.btnP}} onClick={()=>onSave(withPct.filter(r=>r.week&&r.close!=null))}>Save</button>
+              <button style={{...g.btn,...g.btnS}} onClick={onClose}>Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Upload Panel (manual entry + Claude JSON import) ──────────────────────────
+function UploadPanel({onSaveEntry}) {
+  const [source,setSource]=useState("");
+  const [date,setDate]=useState(TODAY);
+  const [markets,setMarkets]=useState([]);
+  const [newMkt,setNewMkt]=useState({market:"",ticker:"",sentiment:"positive"});
+  const [msg,setMsg]=useState(null);
+  const [importRaw,setImportRaw]=useState("");
+  const [mode,setMode]=useState("manual"); // "manual" | "import"
+
+  const addMarket=()=>{
+    if(!newMkt.market.trim()) return;
+    setMarkets(m=>[...m,{...newMkt,quote:""}]);
+    setNewMkt({market:"",ticker:"",sentiment:"positive"});
+  };
+  const removeMarket=i=>setMarkets(m=>m.filter((_,mi)=>mi!==i));
+
+  const save=async()=>{
+    if(!source.trim()||!markets.length){setMsg({err:"Please fill in source and add at least one market."});return;}
+    const entry={id:`e_${Date.now()}`,source:source.trim(),date,markets,text:"",addedAt:Date.now()};
+    try{await onSaveEntry(entry);setMsg({ok:`✓ Saved — ${markets.length} markets for ${source}`});setMarkets([]);setSource("");}
+    catch(e){setMsg({err:"Failed to save: "+e.message});}
+  };
+
+  const importFromClaude=()=>{
+    try{
+      const parsed=JSON.parse(importRaw);
+      const arr=Array.isArray(parsed)?parsed:[parsed];
+      setMarkets(arr.map(m=>({market:m.market||"",ticker:m.ticker||"",sentiment:m.sentiment||"neutral",quote:m.quote||""})));
+      setMsg({ok:`✓ Imported ${arr.length} markets from Claude — review and save`});
+      setMode("manual");
+    }catch{setMsg({err:"Invalid JSON — copy the output exactly from Claude"});}
+  };
+
+  return(
+    <div>
+      <h2 style={g.h2}>Add Article</h2>
+      <div style={g.info}>
+        <strong>How it works:</strong> Paste your article into Claude chat and ask it to identify markets and sentiment.
+        Claude will give you a JSON list — paste it here using the "Import from Claude" tab.
+        Or add markets manually below.
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:16}}>
+        <button style={{...g.btn,...(mode==="manual"?g.btnP:g.btnS),padding:"5px 12px"}} onClick={()=>setMode("manual")}>Manual entry</button>
+        <button style={{...g.btn,...(mode==="import"?g.btnP:g.btnS),padding:"5px 12px"}} onClick={()=>setMode("import")}>Import from Claude</button>
+      </div>
+
+      {mode==="import"&&(
+        <div style={{marginBottom:16}}>
+          <p style={{color:"#6b7280",fontSize:12,marginBottom:8,lineHeight:1.6}}>
+            In Claude chat, paste your article and say:<br/>
+            <em style={{color:"#9ca3af"}}>"Extract markets from this article as a JSON array with fields: market, ticker (Alpha Vantage format), sentiment (positive/negative/neutral), quote"</em><br/>
+            Then paste the JSON output below:
+          </p>
+          <textarea style={{...g.inp,height:120,fontFamily:"monospace",fontSize:12,lineHeight:1.6,marginBottom:8}}
+            value={importRaw} onChange={e=>setImportRaw(e.target.value)} placeholder='[{"market":"Netflix","ticker":"NFLX","sentiment":"positive","quote":"strong subscriber growth expected"}]'/>
+          <button style={{...g.btn,...g.btnP}} onClick={importFromClaude}>Import</button>
+        </div>
+      )}
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px"}}>
+        <div style={g.field}><label style={g.lbl}>Publication *</label><input style={g.inp} value={source} onChange={e=>setSource(e.target.value)} placeholder="e.g. Financial Times"/></div>
+        <div style={g.field}><label style={g.lbl}>Publication date *</label><input style={g.inp} type="date" value={date} onChange={e=>setDate(e.target.value)}/></div>
+      </div>
+
+      {markets.length>0&&(
+        <div style={{marginBottom:14}}>
+          <label style={g.lbl}>Markets to save</label>
+          {markets.map((m,i)=>{const sm=SENT[m.sentiment];return(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #111827",flexWrap:"wrap"}}>
+              <span style={{...g.badge,color:sm.color,background:sm.bg}}>{sm.icon} {m.sentiment}</span>
+              <span style={{color:"#f9fafb",fontWeight:600,flex:1}}>{m.market}</span>
+              {m.ticker&&<span style={g.chip}>{m.ticker}</span>}
+              <button onClick={()=>removeMarket(i)} style={{background:"none",border:"none",color:"#374151",cursor:"pointer",fontSize:13}}>✕</button>
+            </div>
+          );})}
+        </div>
+      )}
+
+      <div style={{background:"#0a0f1a",border:"1px solid #1f2937",borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+        <label style={g.lbl}>Add market</label>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 100px 110px 80px",gap:6}}>
+          <input style={{...g.inp,padding:"6px 8px",fontSize:12}} placeholder="Market name e.g. Netflix" value={newMkt.market} onChange={e=>setNewMkt(m=>({...m,market:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addMarket()}/>
+          <input style={{...g.inp,padding:"6px 8px",fontSize:12}} placeholder="Ticker e.g. NFLX" value={newMkt.ticker} onChange={e=>setNewMkt(m=>({...m,ticker:e.target.value}))}/>
+          <select style={{...g.sel,width:"100%"}} value={newMkt.sentiment} onChange={e=>setNewMkt(m=>({...m,sentiment:e.target.value}))}>
+            <option value="positive">▲ Positive</option>
+            <option value="negative">▼ Negative</option>
+            <option value="neutral">● Neutral</option>
+          </select>
+          <button style={{...g.btn,...g.btnS,padding:"6px 10px"}} onClick={addMarket}>+ Add</button>
+        </div>
+      </div>
+
+      {msg?.err&&<div style={g.err}>{msg.err}</div>}
+      {msg?.ok&&<div style={g.ok}>{msg.ok}</div>}
+      <button style={{...g.btn,...g.btnP}} onClick={save}>Save Article</button>
+    </div>
+  );
+}
+
+// ── Signals Panel ─────────────────────────────────────────────────────────────
+function SignalsPanel({pairs,alerts,showAlerts,onDismissAlerts,onGoToTracker,missingCount}) {
+  const [fSrc,setFSrc]=useState("all");
+  const [fMkt,setFMkt]=useState("all");
+  const [showB,setShowB]=useState(false);
+  const sources=[...new Set(pairs.map(p=>p.source))].sort();
+  const markets=[...new Set(pairs.map(p=>p.market))].sort();
+  const filtered=pairs.filter(p=>(fSrc==="all"||p.source===fSrc)&&(fMkt==="all"||p.market===fMkt));
+  const trusted=filtered.filter(p=>p.isTrusted).sort((a,b)=>(b.accuracy??0)-(a.accuracy??0));
+  const building=filtered.filter(p=>!p.isTrusted&&p.ratedCount>0).sort((a,b)=>b.ratedCount-a.ratedCount);
+  const noData=filtered.filter(p=>p.ratedCount===0).length;
+  if(!pairs.length) return <div style={g.empty}>No data yet — add articles in the ↑ Add Article tab.</div>;
+  return(
+    <div>
+      {showAlerts&&alerts.length>0&&(
+        <div style={{background:"#0d1a0d",border:"1px solid #22c55e44",borderRadius:8,padding:"13px 16px",marginBottom:18}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={{color:"#22c55e",fontFamily:"monospace",fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>⚡ {alerts.length} trusted signal{alerts.length!==1?"s":""} — recent mentions</span>
+            <button onClick={onDismissAlerts} style={{background:"none",border:"none",color:"#374151",cursor:"pointer",fontFamily:"monospace",fontSize:11}}>dismiss</button>
+          </div>
+          {alerts.map((p,i)=>{const sm=SENT[p.recentCall.sentiment];return(
+            <div key={i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"7px 0",borderTop:"1px solid #0a1a0a",flexWrap:"wrap"}}>
+              <div style={{flex:1}}>
+                <span style={{color:"#f9fafb",fontWeight:700}}>{p.source}</span>
+                <span style={{color:"#6b7280",fontSize:12}}> on </span>
+                <span style={{color:"#f9fafb",fontWeight:700}}>{p.market}</span>
+                <span style={{...g.badge,color:sm.color,background:sm.bg,marginLeft:8}}>{sm.icon} {p.recentCall.sentiment}</span>
+                <span style={{color:"#4b5563",fontSize:11,marginLeft:8,fontFamily:"monospace"}}>{ago(p.recentCall.date)}</span>
+              </div>
+              <span style={{color:"#22c55e",fontFamily:"monospace",fontSize:12,fontWeight:700}}>{p.correctCount}/{p.ratedCount} correct</span>
+              {p.recentCall.quote&&<div style={{width:"100%",color:"#4b5563",fontSize:11,fontStyle:"italic"}}>"{p.recentCall.quote}"</div>}
+            </div>
+          );})}
+        </div>
+      )}
+      <h2 style={g.h2}>Trusted Signals</h2>
+      <p style={g.desc}>Publication × market pairs ranked by accuracy. Trusted once {MIN_CORRECT}+ calls are correct over 4 weeks.</p>
+      {missingCount>0&&(
+        <div style={{background:"#1a1200",border:"1px solid #f59e0b33",borderRadius:8,padding:"10px 13px",marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <span style={{color:"#f59e0b",fontSize:12}}>⚠ {missingCount} market{missingCount!==1?"s":""} need price data to unlock ratings</span>
+          <button style={{...g.btn,background:"#f59e0b22",color:"#f59e0b",border:"1px solid #f59e0b44",padding:"5px 11px"}} onClick={onGoToTracker}>→ Go to Tracker</button>
+        </div>
+      )}
+      <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
+        <select style={g.sel} value={fSrc} onChange={e=>setFSrc(e.target.value)}>
+          <option value="all">All publications</option>{sources.map(x=><option key={x} value={x}>{x}</option>)}
+        </select>
+        <select style={g.sel} value={fMkt} onChange={e=>setFMkt(e.target.value)}>
+          <option value="all">All markets</option>{markets.map(x=><option key={x} value={x}>{x}</option>)}
+        </select>
+      </div>
+      {trusted.length===0&&(
+        <div style={{...g.card,textAlign:"center",padding:"22px"}}>
+          <div style={{color:"#4b5563",fontFamily:"monospace",fontSize:12,marginBottom:4}}>No trusted pairs yet</div>
+          <div style={{color:"#374151",fontSize:12}}>Fetch price data in Tracker — once {MIN_CORRECT} correct calls are rated, pairs appear here.</div>
+        </div>
+      )}
+      {trusted.map((p,i)=>{
+        const ac=aC(p.accuracy),sm=SENT[p.lastSentiment],isAlert=alerts.some(a=>a.market===p.market&&a.source===p.source);
+        return(
+          <div key={`${p.market}|||${p.source}`} style={{...g.card,borderColor:isAlert?"#22c55e55":i===0?"#f59e0b33":"#1a2030",background:isAlert?"#0a150a":"#0a0f1a"}}>
+            <div style={{display:"flex",gap:12,alignItems:"flex-start",flexWrap:"wrap"}}>
+              <div style={{color:i===0?"#f59e0b":"#374151",fontFamily:"monospace",fontSize:18,fontWeight:700,minWidth:26,paddingTop:2}}>#{i+1}</div>
+              <div style={{flex:1,minWidth:150}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:5,flexWrap:"wrap"}}>
+                  <span style={{color:"#f9fafb",fontWeight:700,fontSize:14}}>{p.market}</span>
+                  <span style={{color:"#4b5563"}}>·</span>
+                  <span style={{color:"#9ca3af",fontSize:13}}>{p.source}</span>
+                  {isAlert&&<span style={{background:"#052e16",color:"#22c55e",fontFamily:"monospace",fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700}}>⚡ NEW</span>}
+                </div>
+                <AccBar correct={p.correctCount} weak={p.weakCount} wrong={p.wrongCount} total={p.ratedCount}/>
+                <div style={{display:"flex",gap:8,marginTop:4,flexWrap:"wrap"}}>
+                  <span style={{color:"#22c55e",fontFamily:"monospace",fontSize:11}}>✓{p.correctCount}</span>
+                  <span style={{color:"#f59e0b",fontFamily:"monospace",fontSize:11}}>◑{p.weakCount}</span>
+                  <span style={{color:"#ef4444",fontFamily:"monospace",fontSize:11}}>✗{p.wrongCount}</span>
+                  <span style={{color:"#374151",fontFamily:"monospace",fontSize:11}}>of {p.ratedCount} rated · last {ago(p.lastMention)}</span>
+                  <span style={{...g.badge,color:sm.color,background:sm.bg}}>{sm.icon} {p.lastSentiment}</span>
+                </div>
+                {isAlert&&p.recentCall?.quote&&<div style={{color:"#4b5563",fontSize:11,fontStyle:"italic",marginTop:5}}>"{p.recentCall.quote}"</div>}
+              </div>
+              <div style={{textAlign:"center",minWidth:50}}>
+                <div style={{color:ac,fontFamily:"monospace",fontSize:26,fontWeight:700,lineHeight:1}}>{p.accuracy??"-"}</div>
+                <div style={{color:"#374151",fontSize:9,fontFamily:"monospace"}}>accuracy</div>
+                <div style={{color:"#22c55e",fontFamily:"monospace",fontSize:9,marginTop:2}}>TRUSTED</div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+      {building.length>0&&(
+        <>
+          <button onClick={()=>setShowB(x=>!x)} style={{...g.btnSm,marginTop:6,marginBottom:8}}>
+            {showB?"▲ Hide":"▼ Show"} {building.length} pair{building.length!==1?"s":""} building history
+          </button>
+          {showB&&building.map(p=>(
+            <div key={`${p.market}|||${p.source}`} style={{...g.card,opacity:0.65,padding:"10px 13px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
+                <span><span style={{color:"#f9fafb",fontWeight:600}}>{p.market}</span><span style={{color:"#4b5563",fontSize:12}}> · {p.source}</span></span>
+                <span style={{color:"#374151",fontFamily:"monospace",fontSize:11}}>✓{p.correctCount} ◑{p.weakCount} ✗{p.wrongCount} · needs {MIN_CORRECT-p.correctCount} more ✓</span>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+      {noData>0&&<div style={{color:"#374151",fontFamily:"monospace",fontSize:11,marginTop:8}}>+{noData} pair{noData!==1?"s":""} awaiting price data</div>}
+    </div>
+  );
+}
+
+// ── Tracker Panel ─────────────────────────────────────────────────────────────
+function TrackerPanel({entries,weeklyData,onSaveWeeks}) {
+  const [fMkt,setFMkt]=useState("all");
+  const [priceModal,setPriceModal]=useState(null);
+  const [expanded,setExpanded]=useState({});
+  const byMarket={};
+  entries.forEach(e=>{
+    e.markets.forEach(m=>{
+      if(!byMarket[m.market]) byMarket[m.market]={mentions:[],ticker:null};
+      byMarket[m.market].mentions.push({date:e.date,source:e.source,sentiment:m.sentiment});
+      if(m.ticker&&!byMarket[m.market].ticker) byMarket[m.market].ticker=m.ticker;
+    });
+  });
+  const mktList=Object.entries(byMarket).map(([mkt,mk])=>{
+    mk.mentions.sort((a,b)=>a.date.localeCompare(b.date));
+    mk.weeks=weeklyData?.[mkt]?.weeks||[];
+    const sc={positive:0,negative:0,neutral:0};
+    mk.mentions.forEach(m=>sc[m.sentiment]++);
+    mk.dominant=Object.entries(sc).sort(([,a],[,b])=>b-a)[0][0];
+    mk.rating=rateCall(mk.dominant,mk.weeks);
+    mk.cum4w=mk.weeks.length>=4?mk.weeks.slice(0,4).reduce((s,w)=>s+(w.pct??0),0):null;
+    mk.totalCum=mk.weeks.length?mk.weeks.reduce((s,w)=>s+(w.pct??0),0):null;
+    return[mkt,mk];
+  });
+  const pending=mktList.filter(([,mk])=>mk.weeks.length<4);
+  const shown=(fMkt==="all"?mktList:mktList.filter(([m])=>m===fMkt)).sort(([,a],[,b])=>b.mentions.length-a.mentions.length);
+  if(!entries.length) return <div style={g.empty}>No data yet — add articles first.</div>;
+  return(
+    <div>
+      <h2 style={g.h2}>Market Price Tracker</h2>
+      <p style={g.desc}>Weekly % change from first mention. Amber line = 4-week rating window.</p>
+      {pending.length>0&&(
+        <div style={{background:"#0a0f1a",border:"1px solid #f59e0b44",borderRadius:8,padding:"11px 14px",marginBottom:14}}>
+          <div style={{color:"#f59e0b",fontSize:12,fontWeight:600,marginBottom:4}}>⚠ {pending.length} market{pending.length!==1?"s":""} need price data</div>
+          <div style={{color:"#6b7280",fontSize:12}}>Click <strong style={{color:"#e5e7eb"}}>⬇ Fetch</strong>. US stocks: ticker only (NFLX, AAPL). Indices: SPY, QQQ. Gold: GLD. FX: EURUSD.</div>
+        </div>
+      )}
+      <div style={{display:"flex",gap:8,marginBottom:14}}>
+        <select style={g.sel} value={fMkt} onChange={e=>setFMkt(e.target.value)}>
+          <option value="all">All markets</option>{mktList.map(([m])=><option key={m} value={m}>{m}</option>)}
+        </select>
+      </div>
+      {shown.map(([mkt,mk])=>{
+        const firstDate=mk.mentions[0].date,dm=SENT[mk.dominant],rm=RATE[mk.rating]||RATE.pending,isExp=expanded[mkt];
+        return(
+          <div key={mkt} style={g.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10,flexWrap:"wrap",gap:8}}>
+              <div>
+                <span style={{color:"#f9fafb",fontWeight:700,fontSize:14}}>{mkt}</span>
+                {mk.ticker&&<span style={{...g.chip,marginLeft:8}}>{mk.ticker}</span>}
+                <span style={{color:"#374151",fontFamily:"monospace",fontSize:11,marginLeft:8}}>first {firstDate} · {mk.mentions.length} mention{mk.mentions.length!==1?"s":""}</span>
+              </div>
+              <div style={{display:"flex",gap:7,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{...g.badge,color:dm.color,background:dm.bg}}>{dm.icon} {mk.dominant}</span>
+                <span style={{...g.badge,color:rm.color,background:rm.bg}}>{rm.label}{mk.cum4w!=null?` (${mk.cum4w>=0?"+":""}${mk.cum4w.toFixed(1)}% in 4w)`:""}</span>
+                {mk.totalCum!=null&&mk.weeks.length>4&&<span style={{fontFamily:"monospace",fontSize:11,color:mk.totalCum>=0?"#22c55e":"#ef4444"}}>{mk.totalCum>=0?"+":""}{mk.totalCum.toFixed(1)}% total</span>}
+              </div>
+            </div>
+            {mk.weeks.length>=2
+              ?<>
+                <div style={{background:"#060c18",borderRadius:6,padding:"9px 7px 3px",marginBottom:8}}><Sparkline weeks={mk.weeks} sentiment={mk.dominant}/></div>
+                <div style={{display:"flex",gap:7,marginBottom:8,flexWrap:"wrap"}}>
+                  <button style={g.btnSm} onClick={()=>setPriceModal({market:mkt,ticker:mk.ticker,firstDate,weeks:mk.weeks})}>↻ Update</button>
+                  <button style={g.btnSm} onClick={()=>setExpanded(e=>({...e,[mkt]:!e[mkt]}))}>{ isExp?"▲ Hide":"▼ Table"}</button>
+                  <span style={{color:"#374151",fontSize:10,fontFamily:"monospace",alignSelf:"center"}}>{weeklyData?.[mkt]?.source||"fetched"} · {mk.weeks.length}w</span>
+                </div>
+                {isExp&&<WeeklyTable weeks={mk.weeks}/>}
+              </>
+              :<div style={{background:"#060c18",border:"1px dashed #1f2937",borderRadius:6,padding:"12px 14px",marginBottom:8,display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                <div style={{flex:1}}>
+                  <div style={{color:"#4b5563",fontSize:12,fontFamily:"monospace",marginBottom:2}}>No price data yet</div>
+                  <div style={{color:"#374151",fontSize:11}}>Fetch from Alpha Vantage or enter manually</div>
+                </div>
+                <button style={{...g.btn,...g.btnP}} onClick={()=>setPriceModal({market:mkt,ticker:mk.ticker,firstDate,weeks:[]})}>⬇ Fetch</button>
+              </div>
+            }
+            <div style={{borderTop:"1px solid #111827",paddingTop:7}}>
+              {mk.mentions.map((m,i)=>{const sm=SENT[m.sentiment];return(
+                <div key={i} style={{display:"flex",alignItems:"center",gap:7,padding:"4px 0",borderBottom:i<mk.mentions.length-1?"1px solid #0d1117":"none",flexWrap:"wrap"}}>
+                  <span style={{color:"#4b5563",fontFamily:"monospace",fontSize:11,minWidth:70}}>{m.date}</span>
+                  <span style={g.chip}>{m.source}</span>
+                  <span style={{...g.badge,color:sm.color,background:sm.bg}}>{sm.icon} {sm.label}</span>
+                </div>
+              );})}
+            </div>
+          </div>
+        );
+      })}
+      {priceModal&&<PriceModal market={priceModal.market} ticker={priceModal.ticker} fromDate={priceModal.firstDate} existingWeeks={priceModal.weeks} onSave={w=>{onSaveWeeks(priceModal.market,w);setPriceModal(null);}} onClose={()=>setPriceModal(null)}/>}
+    </div>
+  );
+}
+
+// ── Database Panel ────────────────────────────────────────────────────────────
+function DatabasePanel({entries,onDeleteEntry}) {
+  const [fSrc,setFSrc]=useState("all");
+  const sources=[...new Set(entries.map(e=>e.source))];
+  const filtered=(fSrc==="all"?entries:entries.filter(e=>e.source===fSrc)).sort((a,b)=>b.date.localeCompare(a.date));
+  return(
+    <div>
+      <h2 style={g.h2}>All Articles</h2>
+      <p style={g.desc}>Shared across all users via Supabase. Anyone with the app URL can view and add articles.</p>
+      <div style={{display:"flex",gap:8,marginBottom:14}}>
+        <select style={g.sel} value={fSrc} onChange={e=>setFSrc(e.target.value)}>
+          <option value="all">All sources</option>{sources.map(x=><option key={x} value={x}>{x}</option>)}
+        </select>
+      </div>
+      {filtered.length===0&&<div style={g.empty}>No articles yet.</div>}
+      {filtered.map(e=>(
+        <div key={e.id} style={g.card}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+            <div><span style={g.chip}>{e.source}</span><span style={{color:"#6b7280",fontSize:11,marginLeft:7}}>{e.date}</span></div>
+            <button onClick={()=>onDeleteEntry(e.id)} style={{background:"none",border:"none",color:"#374151",cursor:"pointer",fontFamily:"monospace",fontSize:11}}>✕</button>
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+            {e.markets.map((m,i)=>{const sm=SENT[m.sentiment];return(<span key={i} style={{...g.badge,color:sm.color,background:sm.bg}}>{sm.icon} {m.market}</span>);})}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Settings Panel ────────────────────────────────────────────────────────────
+function SettingsPanel() {
+  const [key,setKey]=useState(localStorage.getItem("av_api_key")||"");
+  const [saved,setSaved]=useState(false);
+  const save=()=>{localStorage.setItem("av_api_key",key.trim());setSaved(true);setTimeout(()=>setSaved(false),2000);};
+  return(
+    <div>
+      <h2 style={g.h2}>Settings</h2>
+      <p style={g.desc}>Your Alpha Vantage key is stored in your browser only — it never leaves your device.</p>
+      <div style={{...g.card,maxWidth:480}}>
+        <div style={{color:"#9ca3af",fontFamily:"monospace",fontSize:10,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Alpha Vantage API Key</div>
+        <p style={{color:"#6b7280",fontSize:12,marginBottom:12,lineHeight:1.6}}>
+          Free at <strong style={{color:"#e5e7eb"}}>alphavantage.co</strong> — no card needed, 25 price fetches/day.
+        </p>
+        <div style={{display:"flex",gap:8}}>
+          <input style={{...g.inp,flex:1,fontFamily:"monospace",fontSize:12}} type="password" value={key} onChange={e=>setKey(e.target.value)} placeholder="Paste your key here"/>
+          <button style={{...g.btn,...g.btnP,flexShrink:0}} onClick={save}>Save</button>
+        </div>
+        {saved&&<div style={{...g.ok,marginTop:10,marginBottom:0}}>✓ Key saved to your browser</div>}
+        {key&&!saved&&<div style={{color:"#22c55e",fontSize:11,fontFamily:"monospace",marginTop:8}}>✓ Key is set ({key.length} chars)</div>}
+      </div>
+      <div style={{...g.card,marginTop:10,maxWidth:480}}>
+        <div style={{color:"#9ca3af",fontFamily:"monospace",fontSize:10,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Ticker Reference</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 16px"}}>
+          {[["S&P 500","SPY"],["Nasdaq","QQQ"],["Gold","GLD"],["Oil","USO"],["EUR/USD","EURUSD"],["GBP/USD","GBPUSD"],["USD/JPY","USDJPY"],["Netflix","NFLX"],["Apple","AAPL"],["Tesla","TSLA"],["Microsoft","MSFT"],["Nvidia","NVDA"]].map(([name,ticker])=>(
+            <div key={ticker} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid #111827"}}>
+              <span style={{color:"#9ca3af",fontSize:12}}>{name}</span>
+              <span style={{color:"#f59e0b",fontFamily:"monospace",fontSize:12}}>{ticker}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [tab,setTab]=useState("signals");
+  const [entries,setEntries]=useState([]);
+  const [weeklyData,setWeeklyData]=useState({});
+  const [loading,setLoading]=useState(true);
+  const [loadError,setLoadError]=useState(null);
+  const [alertsDismissed,setAlertsDismissed]=useState(false);
+
+  useEffect(()=>{
+    Promise.all([dbLoadEntries(),dbLoadWeeklyData()])
+      .then(([e,w])=>{setEntries(e);setWeeklyData(w);setLoading(false);})
+      .catch(err=>{setLoadError(err.message);setLoading(false);});
+  },[]);
+
+  const onSaveEntry=async entry=>{
+    await dbSaveEntry(entry);
+    setEntries(prev=>[entry,...prev.filter(e=>e.id!==entry.id)]);
+  };
+  const onDeleteEntry=async id=>{
+    await dbDeleteEntry(id);
+    setEntries(prev=>prev.filter(e=>e.id!==id));
+  };
+  const onSaveWeeks=async(market,weeks)=>{
+    await dbSaveWeeklyData(market,weeks);
+    setWeeklyData(prev=>({...prev,[market]:{weeks,source:"alphavantage"}}));
+  };
+
+  const pairs=buildPairs(entries,weeklyData);
+  const alerts=pairs.filter(p=>p.isTrusted&&p.recentCall);
+  const trustedCount=pairs.filter(p=>p.isTrusted).length;
+  const missingCount=[...new Set(entries.flatMap(e=>e.markets.map(m=>m.market)))].filter(mkt=>!(weeklyData?.[mkt]?.weeks?.length>=4)).length;
+
+  if(loading) return(
+    <div style={{...g.root,display:"flex",alignItems:"center",justifyContent:"center",height:"100vh"}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{color:"#f59e0b",fontFamily:"monospace",fontSize:18,marginBottom:8}}>SIGNAL<span style={{color:"#e5e7eb"}}>.TRACK</span></div>
+        <div style={{color:"#4b5563",fontFamily:"monospace",fontSize:12}}>Connecting to database…</div>
+      </div>
+    </div>
+  );
+
+  if(loadError) return(
+    <div style={{...g.root,display:"flex",alignItems:"center",justifyContent:"center",height:"100vh"}}>
+      <div style={{textAlign:"center",maxWidth:400,padding:20}}>
+        <div style={{color:"#ef4444",fontFamily:"monospace",fontSize:14,marginBottom:8}}>Connection failed</div>
+        <div style={{color:"#6b7280",fontSize:12,marginBottom:16}}>{loadError}</div>
+        <button style={{...g.btn,...g.btnP}} onClick={()=>window.location.reload()}>Retry</button>
+      </div>
+    </div>
+  );
+
+  const tabs=[
+    ["signals",alerts.length&&!alertsDismissed?`★ Signals ⚡${alerts.length}`:"★ Signals"],
+    ["tracker","◎ Tracker"],
+    ["upload","↑ Add Article"],
+    ["database","▤ Articles"],
+    ["settings","⚙ Settings"],
+  ];
+
+  return(
+    <div style={g.root}>
+      <header style={g.header}>
+        <div>
+          <div style={g.logo}>SIGNAL<span style={g.acc}>.TRACK</span></div>
+          <div style={g.tag}>Market Sentiment Monitor · Shared via Supabase</div>
+        </div>
+        <div style={g.sr}>
+          <Stat label="Articles" value={entries.length}/>
+          <Stat label="Pairs" value={pairs.length}/>
+          <Stat label="Trusted" value={trustedCount} color={trustedCount?"#22c55e":undefined}/>
+          <Stat label="Alerts" value={alerts.length} color={alerts.length?"#f59e0b":undefined}/>
+        </div>
+      </header>
+      <nav style={g.nav}>
+        {tabs.map(([id,lbl])=>(
+          <button key={id} style={{...g.tab,...(tab===id?g.tabOn:{})}} onClick={()=>setTab(id)}>{lbl}</button>
+        ))}
+      </nav>
+      <main style={g.main}>
+        {tab==="signals"&&<SignalsPanel pairs={pairs} alerts={alertsDismissed?[]:alerts} showAlerts={!alertsDismissed} onDismissAlerts={()=>setAlertsDismissed(true)} onGoToTracker={()=>setTab("tracker")} missingCount={missingCount}/>}
+        {tab==="tracker"&&<TrackerPanel entries={entries} weeklyData={weeklyData} onSaveWeeks={onSaveWeeks}/>}
+        {tab==="upload"&&<UploadPanel onSaveEntry={onSaveEntry}/>}
+        {tab==="database"&&<DatabasePanel entries={entries} onDeleteEntry={onDeleteEntry}/>}
+        {tab==="settings"&&<SettingsPanel/>}
+      </main>
+      <footer style={g.footer}>
+        Trusted = {MIN_CORRECT}+ correct · 4w window · ±{MAGNITUDE}% threshold · {new Date().toLocaleDateString("en-GB",{month:"long",year:"numeric"})}
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
